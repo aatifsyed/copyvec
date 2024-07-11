@@ -156,7 +156,7 @@ impl<T, const N: usize> CopyVec<T, N> {
     where
         T: Copy,
     {
-        match self.len() > self.capacity() {
+        match self.len() >= self.capacity() {
             true => Err(value),
             false => {
                 self.inner[self.len()].write(value);
