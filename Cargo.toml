@@ -2,5 +2,22 @@
 name = "copyvec"
 version = "0.1.0"
 edition = "2021"
+description = "A contiguous growable array type, with a fixed, stack-alllocated capacity that implements Copy."
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/copyvec"
+repository = "https://github.com/aatifsyed/copyvec"
+homepage = "https://crates.io/crates/copyvec"
+categories = [
+    "rust-patterns",
+    "no-std::no-alloc",
+    "no-std",
+    "memory-management",
+    "data-structures",
+]
 
 [dependencies]
+
+[features]
+alloc = []
+default = ["std"]
+std = ["alloc"]
