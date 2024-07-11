@@ -18,7 +18,7 @@ use core::{
     fmt,
     hash::Hash,
     iter::{FusedIterator, Take},
-    mem::MaybeUninit,
+    mem::{self, MaybeUninit},
     ops::{Deref, DerefMut, Index, IndexMut},
     slice::{self, SliceIndex},
 };
@@ -70,7 +70,10 @@ impl<T, const N: usize> CopyVec<T, N> {
     /// assert_eq!(vec.capacity(), 10);
     /// ```
     pub const fn capacity(&self) -> usize {
-        N
+        match T::IS_ZST {
+            true => usize::MAX,
+            false => N,
+        }
     }
 
     // pub fn reserve(&mut self, additional: usize)
@@ -96,24 +99,25 @@ impl<T, const N: usize> CopyVec<T, N> {
     pub fn truncate(&mut self, len: usize) {
         if len < self.len() {
             self.occupied = len;
-            for i in len..self.len() {
-                unsafe { self.inner[i].assume_init_drop() };
+            if !T::IS_ZST {
+                for i in len..self.len() {
+                    unsafe { self.inner[i].assume_init_drop() };
+                }
             }
         }
     }
-    const fn slice_parts(&self) -> (*const T, usize) {
-        (self.inner.as_ptr().cast(), self.occupied)
-    }
     pub const fn as_slice(&self) -> &[T] {
-        let (data, len) = self.slice_parts();
-        unsafe { slice::from_raw_parts(data, len) }
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        let (data, len) = self.slice_parts();
-        unsafe { slice::from_raw_parts_mut(data.cast_mut(), len) }
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
     }
-    // pub fn as_ptr(&self) -> *const T
-    // pub fn as_mut_ptr(&mut self) -> *mut T
+    pub const fn as_ptr(&self) -> *const T {
+        self.inner.as_ptr().cast()
+    }
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.inner.as_mut_ptr().cast()
+    }
     // pub fn allocator(&self) -> &A
     // pub unsafe fn set_len(&mut self, new_len: usize)
     // pub fn swap_remove(&mut self, index: usize) -> T
@@ -148,7 +152,7 @@ impl<T, const N: usize> CopyVec<T, N> {
     {
         match self.push_within_capacity(value) {
             Ok(()) => {}
-            Err(_) => panic!("exceeded capacity of vector"),
+            Err(_) => panic!("exceeded fixed capacity {} of vector", self.capacity()),
         }
     }
 
@@ -159,7 +163,9 @@ impl<T, const N: usize> CopyVec<T, N> {
         match self.len() >= self.capacity() {
             true => Err(value),
             false => {
-                self.inner[self.len()].write(value);
+                if !T::IS_ZST {
+                    self.inner[self.len()].write(value);
+                }
                 self.occupied += 1;
                 Ok(())
             }
@@ -170,7 +176,10 @@ impl<T, const N: usize> CopyVec<T, N> {
             true => None,
             false => {
                 self.occupied -= 1;
-                Some(unsafe { self.inner[self.len()].assume_init_read() })
+                match T::IS_ZST {
+                    true => Some(unsafe { MaybeUninit::zeroed().assume_init() }),
+                    false => Some(unsafe { self.inner[self.len()].assume_init_read() }),
+                }
             }
         }
     }
@@ -189,10 +198,10 @@ impl<T, const N: usize> CopyVec<T, N> {
         self.truncate(0)
     }
     pub const fn len(&self) -> usize {
-        self.as_slice().len()
+        self.occupied
     }
     pub const fn is_empty(&self) -> bool {
-        self.as_slice().is_empty()
+        self.len() == 0
     }
     // pub fn split_off(&mut self, at: usize) -> Vec<T, A>
 
@@ -667,6 +676,11 @@ impl<const N: usize> io::Write for CopyVec<u8, N> {
 
 impl<T, const N: usize> Eq for CopyVec<T, N> where T: Eq {}
 
+trait Ext: Sized {
+    const IS_ZST: bool = mem::size_of::<Self>() == 0;
+}
+impl<T> Ext for T {}
+
 #[cfg(all(test, feature = "std"))]
 mod tests {
     use fmt::Debug;
@@ -749,6 +763,9 @@ mod tests {
 
     quickcheck::quickcheck! {
         fn quickcheck_10_u8(ops: Vec<Op<u8>>) -> () {
+            do_test::<10, _>(ops)
+        }
+        fn quickcheck_10_unit(ops: Vec<Op<()>>) -> () {
             do_test::<10, _>(ops)
         }
     }
