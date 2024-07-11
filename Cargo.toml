@@ -21,3 +21,6 @@ categories = [
 alloc = []
 default = ["std"]
 std = ["alloc"]
+
+[dev-dependencies]
+quickcheck = "1.0.3"

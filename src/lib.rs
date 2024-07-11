@@ -666,3 +666,90 @@ impl<const N: usize> io::Write for CopyVec<u8, N> {
 //     A: Allocator,
 
 impl<T, const N: usize> Eq for CopyVec<T, N> where T: Eq {}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use fmt::Debug;
+    use quickcheck::Arbitrary;
+
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    enum Op<T> {
+        Push(T),
+        Pop,
+        Truncate(usize),
+        Clear,
+    }
+
+    impl<T> Arbitrary for Op<T>
+    where
+        T: Clone + Arbitrary,
+    {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            let options = [
+                Op::Push(T::arbitrary(g)),
+                Op::Pop,
+                Op::Truncate(usize::arbitrary(g)),
+                Op::Clear,
+            ];
+            g.choose(&options).unwrap().clone()
+        }
+    }
+
+    fn check_invariants<const N: usize, T: PartialEq + Debug>(
+        ours: &mut CopyVec<T, N>,
+        theirs: &mut Vec<T>,
+    ) {
+        assert!(ours.iter().eq(theirs.iter()));
+        assert!(ours.iter_mut().eq(theirs.iter_mut()));
+        assert_eq!(ours.capacity(), theirs.capacity());
+        assert_eq!(ours.len(), theirs.len());
+        assert_eq!(ours.as_slice(), theirs.as_slice());
+    }
+
+    fn do_test<const N: usize, T: PartialEq + Copy + Debug>(ops: Vec<Op<T>>) {
+        let mut ours = CopyVec::<T, N>::new();
+        let mut theirs = Vec::new();
+        theirs.reserve_exact(N);
+        check_invariants(&mut ours, &mut theirs);
+        for op in ops {
+            match op {
+                Op::Push(it) => {
+                    assert_eq!(
+                        ours.push_within_capacity(it),
+                        push_within_capacity(&mut theirs, it)
+                    );
+                }
+                Op::Pop => {
+                    assert_eq!(ours.pop(), theirs.pop())
+                }
+                Op::Truncate(u) => {
+                    ours.truncate(u);
+                    theirs.truncate(u)
+                }
+                Op::Clear => {
+                    ours.clear();
+                    theirs.clear();
+                }
+            }
+            check_invariants(&mut ours, &mut theirs)
+        }
+    }
+
+    fn push_within_capacity<T>(v: &mut Vec<T>, value: T) -> Result<(), T> {
+        match v.spare_capacity_mut().is_empty() {
+            true => Err(value),
+            false => {
+                v.push(value);
+                Ok(())
+            }
+        }
+    }
+
+    quickcheck::quickcheck! {
+        fn quickcheck_10_u8(ops: Vec<Op<u8>>) -> () {
+            do_test::<10, _>(ops)
+        }
+    }
+}
