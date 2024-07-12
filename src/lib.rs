@@ -9,7 +9,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 #[cfg(feature = "alloc")]
-use alloc::boxed::Box;
+use alloc::{borrow::Cow, boxed::Box};
 
 use core::{
     array,
@@ -20,21 +20,101 @@ use core::{
     iter::{FusedIterator, Take},
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut, Index, IndexMut},
+    ptr,
     slice::{self, SliceIndex},
 };
 
 #[cfg(feature = "std")]
 use std::io;
 
+/// Create a [`CopyVec`] filled with the given arguments.
+///
+/// The syntax is similar to [`vec!`](std::vec!)'s,
+/// but additional capacity may be specified with `+ <extra>`.
+///
+/// ```
+/// # use copyvec::copyvec;
+/// let mut exact = copyvec!["a", "b", "c"];
+/// assert_eq!(exact.capacity(), 3);
+///
+/// let with_spare = copyvec!["a", "b", "c"; + 5];
+/// assert_eq!(with_spare.capacity(), 8);
+///
+/// let exact = copyvec!["a"; 3];
+/// assert_eq!(exact, ["a", "a", "a"]);
+///
+/// let with_spare = copyvec!["a"; 3; + 5];
+/// assert_eq!(with_spare, ["a", "a", "a"]);
+/// ```
+///
+/// It may also be used in `const` expressions:
+/// ```
+/// # use copyvec::copyvec;
+/// const _: () = {
+///     copyvec!["a", "b", "c"];
+///     copyvec!["a", "b", "c"; + 5];
+///     copyvec!["a"; 3];
+///     copyvec!["a"; 3; + 5];
+/// };
+/// ```
+#[macro_export]
+macro_rules! copyvec {
+    [$($el:expr),* $(,)?; + $extra:expr] => {
+        $crate::__private::from_slice::<_, {
+            [
+                $($crate::__private::stringify!($el)),*
+            ].len() + $extra
+        }>(&[
+            $($el),*
+        ])
+    };
+    [$($el:expr),* $(,)?] => {
+        $crate::CopyVec::from_array([$($el,)*])
+    };
+    [$fill:expr; $len:expr; + $extra:expr] => {
+        $crate::__private::from_slice::<_, { $len + $extra }>(
+            &[$fill; $len]
+        )
+    };
+    [$fill:expr; $len:expr] => {
+        $crate::CopyVec::from_array([$fill; $len])
+    };
+}
+
+#[doc(hidden)]
+pub mod __private {
+    use super::*;
+    pub use ::core::stringify;
+
+    pub const fn from_slice<T, const N: usize>(slice: &[T]) -> CopyVec<T, N>
+    where
+        T: Copy,
+    {
+        if slice.len() > N {
+            panic!("initializer length is greater than backing storage length")
+        }
+        let mut buf = [const { MaybeUninit::uninit() }; N];
+        let mut ix = slice.len();
+        while let Some(nix) = ix.checked_sub(1) {
+            ix = nix;
+            buf[ix] = MaybeUninit::new(slice[ix]);
+        }
+        CopyVec {
+            occupied: slice.len(),
+            buf,
+        }
+    }
+}
+
 /// A contiguous growable array type, with a fixed, stack-alllocated capacity.
 #[derive(Copy)]
 pub struct CopyVec<T, const N: usize> {
     occupied: usize,
-    inner: [MaybeUninit<T>; N],
+    buf: [MaybeUninit<T>; N],
 }
 
 impl<T, const N: usize> CopyVec<T, N> {
-    /// Constructs a new, empty `CopyVec<T>`.
+    /// Constructs a new, empty `CopyVec<T>`, with space for `N` elements.
     ///
     /// # Examples
     ///
@@ -45,7 +125,7 @@ impl<T, const N: usize> CopyVec<T, N> {
     pub const fn new() -> Self {
         Self {
             occupied: 0,
-            inner: [const { MaybeUninit::uninit() }; N],
+            buf: [const { MaybeUninit::uninit() }; N],
         }
     }
 
@@ -60,6 +140,8 @@ impl<T, const N: usize> CopyVec<T, N> {
     // pub fn into_raw_parts_with_alloc(self) -> (*mut T, usize, usize, A)
 
     /// Returns the total number of elements the vector can hold.
+    ///
+    /// This is always equal to `N` for non-zero sized types.
     ///
     /// # Examples
     ///
@@ -96,33 +178,206 @@ impl<T, const N: usize> CopyVec<T, N> {
     /// Shortens the vector, keeping the first `len` elements and dropping the rest.
     ///
     /// If `len` is greater or equal to the vector’s current length, this has no effect.
+    ///
+    // The [`drain`](Self::drain) method can emulate truncate, but causes the excess elements to be returned instead of dropped.
+    //
+    /// # Examples
+    ///
+    /// Truncating a five element vector to two elements:
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3, 4, 5];
+    /// vec.truncate(2);
+    /// assert_eq!(vec, [1, 2]);
+    /// ```
+    ///
+    /// No truncation occurs when `len` is greater than the vector's current
+    /// length:
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3];
+    /// vec.truncate(8);
+    /// assert_eq!(vec, [1, 2, 3]);
+    /// ```
+    ///
+    /// Truncating when `len == 0` is equivalent to calling the [`clear`](Self::clear)
+    /// method.
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3];
+    /// vec.truncate(0);
+    /// assert_eq!(vec, []);
+    /// ```
     pub fn truncate(&mut self, len: usize) {
-        if len < self.len() {
+        if len > self.occupied {
+            return;
+        }
+        let remaining_len = self.occupied - len;
+        unsafe {
+            let s = ptr::slice_from_raw_parts_mut(self.as_mut_ptr().add(len), remaining_len);
             self.occupied = len;
-            if !T::IS_ZST {
-                for i in len..self.len() {
-                    unsafe { self.inner[i].assume_init_drop() };
-                }
-            }
+            ptr::drop_in_place(s);
         }
     }
+    /// Extracts a slice containing the entire vector.
+    ///
+    /// Equivalent to `&s[..]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// use std::io::{self, Write};
+    /// let buffer = copyvec![1, 2, 3, 5, 8];
+    /// io::sink().write(buffer.as_slice()).unwrap();
+    /// ```
     pub const fn as_slice(&self) -> &[T] {
         unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) }
     }
+    /// Extracts a mutable slice of the entire vector.
+    ///
+    /// Equivalent to `&mut s[..]`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// use std::io::{self, Read};
+    /// let mut buffer = copyvec![0; 3];
+    /// io::repeat(0b101).read_exact(buffer.as_mut_slice()).unwrap();
+    /// ```
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
     }
+    /// See [`std::vec::Vec::as_ptr`].
     pub const fn as_ptr(&self) -> *const T {
-        self.inner.as_ptr().cast()
+        self.buf.as_ptr().cast()
     }
+    /// See [`std::vec::Vec::as_mut_ptr`].
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.inner.as_mut_ptr().cast()
+        self.buf.as_mut_ptr().cast()
     }
     // pub fn allocator(&self) -> &A
-    // pub unsafe fn set_len(&mut self, new_len: usize)
-    // pub fn swap_remove(&mut self, index: usize) -> T
-    // pub fn insert(&mut self, index: usize, element: T)
-    // pub fn remove(&mut self, index: usize) -> T
+
+    /// See [`std::vec::Vec::set_len`].
+    ///
+    /// # Safety
+    /// - `new_len` must be less than or equal to [`capacity()`](Self::capacity).
+    /// - The elements at `old_len..new_len` must be initialized.
+    pub unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.capacity());
+        self.occupied = new_len
+    }
+
+    /// Removes an element from the vector and returns it.
+    ///
+    /// The removed element is replaced by the last element of the vector.
+    ///
+    /// This does not preserve ordering of the remaining elements, but is *O*(1).
+    /// If you need to preserve the element order, use [`remove`](Self::remove) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut v = copyvec!["foo", "bar", "baz", "qux"];
+    ///
+    /// assert_eq!(v.swap_remove(1), "bar");
+    /// assert_eq!(v, ["foo", "qux", "baz"]);
+    ///
+    /// assert_eq!(v.swap_remove(0), "foo");
+    /// assert_eq!(v, ["baz", "qux"]);
+    /// ```
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        let len = self.len();
+        if index >= len {
+            panic!("swap_remove index (is {index}) should be < len (is {len})")
+        }
+        unsafe {
+            let value = ptr::read(self.as_ptr().add(index));
+            let base_ptr = self.as_mut_ptr();
+            ptr::copy(base_ptr.add(len - 1), base_ptr.add(index), 1);
+            self.set_len(len - 1);
+            value
+        }
+    }
+
+    /// Inserts an element at position `index` within the vector, shifting all
+    /// elements after it to the right.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index > len`, or the capacity is exceeded.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3; + 2];
+    /// vec.insert(1, 4);
+    /// assert_eq!(vec, [1, 4, 2, 3]);
+    /// vec.insert(4, 5);
+    /// assert_eq!(vec, [1, 4, 2, 3, 5]);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*([`len`](Self::len)) time. All items after the insertion index must be
+    /// shifted to the right. In the worst case, all elements are shifted when
+    /// the insertion index is 0.
+    pub fn insert(&mut self, index: usize, element: T)
+    where
+        T: Copy,
+    {
+        let len = self.len();
+        if index > len {
+            panic!("insertion index (is {index}) should be <= len (is {len})",)
+        }
+        self.push(element);
+        self.as_mut_slice()[index..].rotate_right(1)
+    }
+    /// Removes and returns the element at position `index` within the vector,
+    /// shifting all elements after it to the left.
+    ///
+    /// Note: Because this shifts over the remaining elements, it has a
+    /// worst-case performance of *O*(*n*). If you don't need the order of elements
+    /// to be preserved, use [`swap_remove`](Self::swap_remove) instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut v = copyvec![1, 2, 3];
+    /// assert_eq!(v.remove(1), 2);
+    /// assert_eq!(v, [1, 3]);
+    /// ```
+    pub fn remove(&mut self, index: usize) -> T {
+        let len = self.len();
+        if index >= len {
+            panic!("removal index (is {index}) should be < len (is {len})");
+        }
+        unsafe {
+            let ret;
+            {
+                let ptr = self.as_mut_ptr().add(index);
+                ret = ptr::read(ptr);
+                ptr::copy(ptr.add(1), ptr, len - index - 1);
+            }
+            self.set_len(len - 1);
+            ret
+        }
+    }
 
     // pub fn retain<F>(&mut self, f: F)
     // where
@@ -145,7 +400,15 @@ impl<T, const N: usize> CopyVec<T, N> {
     ///
     /// # Panics
     /// - If the underlying storage has been exhausted.
-    ///   Use [`Self::push_within_capacity`] to handle the error instead.
+    ///   Use [`Self::push_within_capacity`] or [`Self::try_push`]
+    ///   to handle the error instead,
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2; + 1];
+    /// vec.push(3);
+    /// assert_eq!(vec, [1, 2, 3]);
+    /// ```
     pub fn push(&mut self, value: T)
     where
         T: Copy,
@@ -156,6 +419,23 @@ impl<T, const N: usize> CopyVec<T, N> {
         }
     }
 
+    /// Appends an element if there is sufficient spare capacity, otherwise an error is returned
+    /// with the element.
+    ///
+    /// See also [`Self::try_push`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::CopyVec;
+    /// let mut vec = CopyVec::<_, 1>::new();
+    /// vec.push_within_capacity('a').unwrap();
+    /// vec.push_within_capacity('b').unwrap_err();
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) time.
     pub fn push_within_capacity(&mut self, value: T) -> Result<(), T>
     where
         T: Copy,
@@ -164,22 +444,34 @@ impl<T, const N: usize> CopyVec<T, N> {
             true => Err(value),
             false => {
                 if !T::IS_ZST {
-                    self.inner[self.len()].write(value);
+                    self.buf[self.len()].write(value);
                 }
                 self.occupied += 1;
                 Ok(())
             }
         }
     }
+    /// Removes the last element from a vector and returns it, or [`None`] if it
+    /// is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3];
+    /// assert_eq!(vec.pop(), Some(3));
+    /// assert_eq!(vec, [1, 2]);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) time.
     pub fn pop(&mut self) -> Option<T> {
         match self.occupied == 0 {
             true => None,
             false => {
                 self.occupied -= 1;
-                match T::IS_ZST {
-                    true => Some(unsafe { MaybeUninit::zeroed().assume_init() }),
-                    false => Some(unsafe { self.inner[self.len()].assume_init_read() }),
-                }
+                Some(unsafe { ptr::read(self.as_ptr().add(self.len())) })
             }
         }
     }
@@ -194,12 +486,46 @@ impl<T, const N: usize> CopyVec<T, N> {
     // where
     //     R: RangeBounds<usize>,
 
+    /// Clears the vector, removing all values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut v = copyvec![1, 2, 3];
+    ///
+    /// v.clear();
+    ///
+    /// assert!(v.is_empty());
+    /// ```
     pub fn clear(&mut self) {
         self.truncate(0)
     }
+    /// Returns the number of elements in the vector, also referred to
+    /// as its 'length'.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let a = copyvec![1, 2, 3];
+    /// assert_eq!(a.len(), 3);
+    /// ```
     pub const fn len(&self) -> usize {
         self.occupied
     }
+    /// Returns `true` if the vector contains no elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::CopyVec;
+    /// let mut v = CopyVec::<_, 1>::new();
+    /// assert!(v.is_empty());
+    ///
+    /// v.push(1);
+    /// assert!(!v.is_empty());
+    /// ```
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -210,7 +536,43 @@ impl<T, const N: usize> CopyVec<T, N> {
     //     F: FnMut() -> T,
 
     // pub fn leak<'a>(self) -> &'a mut [T]
-    // pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>]
+
+    /// Returns the remaining spare capacity of the vector as a slice of
+    /// `MaybeUninit<T>`.
+    ///
+    /// The returned slice can be used to fill the vector with data (e.g. by
+    /// reading from a file) before marking the data as initialized using the
+    /// [`set_len`](Self::set_len) method.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::CopyVec;
+    /// // Vector is big enough for 10 elements.
+    /// let mut v = CopyVec::<_, 10>::new();
+    ///
+    /// // Fill in the first 3 elements.
+    /// let uninit = v.spare_capacity_mut();
+    /// uninit[0].write(0);
+    /// uninit[1].write(1);
+    /// uninit[2].write(2);
+    ///
+    /// // Mark the first 3 elements of the vector as being initialized.
+    /// unsafe {
+    ///     v.set_len(3);
+    /// }
+    ///
+    /// assert_eq!(&v, &[0, 1, 2]);
+    /// ```
+    pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        unsafe {
+            slice::from_raw_parts_mut(
+                self.as_mut_ptr().add(self.len()).cast(),
+                self.capacity() - self.len(),
+            )
+        }
+    }
+
     // pub fn split_at_spare_mut(&mut self) -> (&mut [T], &mut [MaybeUninit<T>])
     // pub fn resize(&mut self, new_len: usize, value: T) where T: Clone
     // pub fn extend_from_slice(&mut self, other: &[T]) where T: Clone
@@ -235,13 +597,13 @@ impl<T, const N: usize> CopyVec<T, N> {
     where
         T: Copy,
     {
-        let mut inner = [const { MaybeUninit::uninit() }; N];
+        let mut buf = [const { MaybeUninit::uninit() }; N];
         let mut ix = N;
         while let Some(nix) = ix.checked_sub(1) {
             ix = nix;
-            inner[ix] = MaybeUninit::new(array[ix])
+            buf[ix] = MaybeUninit::new(array[ix])
         }
-        Self { occupied: N, inner }
+        Self { occupied: N, buf }
     }
     /// Like [`Self::push_within_capacity`], but returns a [`std::error::Error`].
     pub fn try_push(&mut self, value: T) -> Result<(), Error>
@@ -284,6 +646,7 @@ impl<T, const N: usize> CopyVec<T, N> {
     }
 }
 
+/// Error returned from [`CopyVec::try_push`], [`CopyVec::try_extend`] or [`CopyVec::try_from_iter`].
 pub struct Error {
     capacity: usize,
     /// [`None`] if returned from [`CopyVec::try_push`].
@@ -525,7 +888,10 @@ impl<T, const N: usize> IntoIterator for CopyVec<T, N> {
     type Item = T;
     type IntoIter = IntoIter<T, N>;
     fn into_iter(self) -> Self::IntoIter {
-        let Self { occupied, inner } = self;
+        let Self {
+            occupied,
+            buf: inner,
+        } = self;
         IntoIter {
             inner: inner.into_iter().take(occupied),
         }
@@ -571,50 +937,87 @@ where
     }
 }
 
-// impl<T, U, A> PartialEq<&[U]> for Vec<T, A>
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize> PartialEq<&[U]> for CopyVec<T, N>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&[U]) -> bool {
+        self.as_slice() == *other
+    }
+}
 
-// impl<T, U, A, const N: usize> PartialEq<&[U; N]> for Vec<T, A>
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize, const M: usize> PartialEq<&[U; M]> for CopyVec<T, N>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&[U; M]) -> bool {
+        self.as_slice() == *other
+    }
+}
 
-// impl<T, U, A> PartialEq<&mut [U]> for Vec<T, A>
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize> PartialEq<&mut [U]> for CopyVec<T, N>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&mut [U]) -> bool {
+        self.as_slice() == *other
+    }
+}
 
-// impl<T, U, A> PartialEq<[U]> for Vec<T, A>
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize> PartialEq<[U]> for CopyVec<T, N>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U]) -> bool {
+        self.as_slice() == other
+    }
+}
 
-// impl<T, U, A, const N: usize> PartialEq<[U; N]> for Vec<T, A>
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize, const M: usize> PartialEq<[U; M]> for CopyVec<T, N>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U; M]) -> bool {
+        self.as_slice() == other
+    }
+}
 
-// impl<T, U, A> PartialEq<Vec<U, A>> for &[T]
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize> PartialEq<CopyVec<U, N>> for &[T]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &CopyVec<U, N>) -> bool {
+        *self == other.as_slice()
+    }
+}
 
-// impl<T, U, A> PartialEq<Vec<U, A>> for &mut [T]
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize> PartialEq<CopyVec<U, N>> for &mut [T]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &CopyVec<U, N>) -> bool {
+        *self == other.as_slice()
+    }
+}
 
-// impl<T, U, A> PartialEq<Vec<U, A>> for [T]
-// where
-//     A: Allocator,
-//     T: PartialEq<U>,
+impl<T, U, const N: usize> PartialEq<CopyVec<U, N>> for [T]
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &CopyVec<U, N>) -> bool {
+        self == other.as_slice()
+    }
+}
 
-// impl<T, U, A> PartialEq<Vec<U, A>> for Cow<'_, [T]>
-// where
-//     A: Allocator,
-//     T: PartialEq<U> + Clone,
+#[cfg(feature = "alloc")]
+impl<T, U, const N: usize> PartialEq<CopyVec<U, N>> for Cow<'_, [T]>
+where
+    T: PartialEq<U> + Clone,
+{
+    fn eq(&self, other: &CopyVec<U, N>) -> bool {
+        *self == other.as_slice()
+    }
+}
 
 // impl<T, U, A> PartialEq<Vec<U, A>> for VecDeque<T, A>
 // where
@@ -694,6 +1097,9 @@ mod tests {
         Pop,
         Truncate(usize),
         Clear,
+        Insert(usize, T),
+        SwapRemove(usize),
+        Remove(usize),
     }
 
     impl<T> Arbitrary for Op<T>
@@ -706,6 +1112,9 @@ mod tests {
                 Op::Pop,
                 Op::Truncate(usize::arbitrary(g)),
                 Op::Clear,
+                Op::Insert(usize::arbitrary(g), T::arbitrary(g)),
+                Op::SwapRemove(usize::arbitrary(g)),
+                Op::Remove(usize::arbitrary(g)),
             ];
             g.choose(&options).unwrap().clone()
         }
@@ -746,6 +1155,22 @@ mod tests {
                     ours.clear();
                     theirs.clear();
                 }
+                Op::Insert(ix, it) => {
+                    if ix <= theirs.len() && !theirs.spare_capacity_mut().is_empty() {
+                        ours.insert(ix, it);
+                        theirs.insert(ix, it);
+                    }
+                }
+                Op::SwapRemove(ix) => {
+                    if ix < theirs.len() {
+                        assert_eq!(ours.swap_remove(ix), theirs.swap_remove(ix))
+                    }
+                }
+                Op::Remove(ix) => {
+                    if ix < theirs.len() {
+                        assert_eq!(ours.remove(ix), theirs.remove(ix))
+                    }
+                }
             }
             check_invariants(&mut ours, &mut theirs)
         }
@@ -762,6 +1187,12 @@ mod tests {
     }
 
     quickcheck::quickcheck! {
+        fn quickcheck_0_u8(ops: Vec<Op<u8>>) -> () {
+            do_test::<10, _>(ops)
+        }
+        fn quickcheck_0_unit(ops: Vec<Op<()>>) -> () {
+            do_test::<10, _>(ops)
+        }
         fn quickcheck_10_u8(ops: Vec<Op<u8>>) -> () {
             do_test::<10, _>(ops)
         }
