@@ -22,7 +22,7 @@ use core::{
     cmp::Ordering,
     fmt,
     hash::Hash,
-    iter::{FusedIterator, Take},
+    iter::{self, FusedIterator, Take},
     mem::{self, MaybeUninit},
     ops::{Deref, DerefMut, Index, IndexMut},
     ptr,
@@ -384,22 +384,142 @@ impl<T, const N: usize> CopyVec<T, N> {
         }
     }
 
-    // pub fn retain<F>(&mut self, f: F)
-    // where
-    //     F: FnMut(&T) -> bool,
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` for which `f(&e)` returns `false`.
+    /// This method operates in place, visiting each element exactly once in the
+    /// original order, and preserves the order of the retained elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut vec = vec![1, 2, 3, 4];
+    /// vec.retain(|&x| x % 2 == 0);
+    /// assert_eq!(vec, [2, 4]);
+    /// ```
+    ///
+    /// Because the elements are visited exactly once in the original order,
+    /// external state may be used to decide which elements to keep.
+    ///
+    /// ```
+    /// let mut vec = vec![1, 2, 3, 4, 5];
+    /// let keep = [false, true, true, false, true];
+    /// let mut iter = keep.iter();
+    /// vec.retain(|_| *iter.next().unwrap());
+    /// assert_eq!(vec, [2, 3, 5]);
+    /// ```
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.retain_mut(|it| f(it))
+    }
 
-    // pub fn retain_mut<F>(&mut self, f: F)
-    // where
-    //     F: FnMut(&mut T) -> bool,
+    /// Retains only the elements specified by the predicate, passing a mutable reference to it.
+    ///
+    /// In other words, remove all elements `e` such that `f(&mut e)` returns `false`.
+    /// This method operates in place, visiting each element exactly once in the
+    /// original order, and preserves the order of the retained elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3, 4];
+    /// vec.retain_mut(|x| if *x <= 3 {
+    ///     *x += 1;
+    ///     true
+    /// } else {
+    ///     false
+    /// });
+    /// assert_eq!(vec, [2, 3, 4]);
+    /// ```
+    pub fn retain_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let mut retain = [true; N];
+        let retain = &mut retain[..self.len()];
+        for (it, retain) in iter::zip(self.iter_mut(), &mut *retain) {
+            *retain = f(it);
+        }
+        let mut ct = 0;
+        for (ix, retain) in retain.iter().enumerate() {
+            if !retain {
+                self.remove(ix - ct);
+                ct += 1;
+            }
+        }
+    }
 
-    // pub fn dedup_by_key<F, K>(&mut self, key: F)
-    // where
-    //     F: FnMut(&mut T) -> K,
-    //     K: PartialEq,
+    /// Removes all but the first of consecutive elements in the vector that resolve to the same
+    /// key.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![10, 20, 21, 30, 20];
+    ///
+    /// vec.dedup_by_key(|i| *i / 10);
+    ///
+    /// assert_eq!(vec, [10, 20, 30, 20]);
+    /// ```
+    pub fn dedup_by_key<F, K>(&mut self, mut key: F)
+    where
+        F: FnMut(&mut T) -> K,
+        K: PartialEq,
+    {
+        self.dedup_by(|l, r| key(l) == key(r))
+    }
 
-    // pub fn dedup_by<F>(&mut self, same_bucket: F)
-    // where
-    //     F: FnMut(&mut T, &mut T) -> bool,
+    /// Removes all but the first of consecutive elements in the vector satisfying a given equality
+    /// relation.
+    ///
+    /// The `same_bucket` function is passed references to two elements from the vector and
+    /// must determine if the elements compare equal. The elements are passed in opposite order
+    /// from their order in the slice, so if `same_bucket(a, b)` returns `true`, `a` is removed.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec!["foo", "bar", "Bar", "baz", "bar"];
+    ///
+    /// vec.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    ///
+    /// assert_eq!(vec, ["foo", "bar", "baz", "bar"]);
+    /// ```
+    pub fn dedup_by<F>(&mut self, mut same_bucket: F)
+    where
+        F: FnMut(&mut T, &mut T) -> bool,
+    {
+        let mut buf = [const { MaybeUninit::<T>::uninit() }; N];
+        let mut occupied = 0;
+        let mut iter = self.iter_mut();
+
+        let Some(mut bucket) = iter.next() else {
+            return;
+        };
+
+        for next in iter {
+            match same_bucket(next, bucket) {
+                true => continue,
+                false => {
+                    unsafe { ptr::swap_nonoverlapping(buf[occupied].as_mut_ptr(), bucket, 1) };
+                    bucket = next;
+                    occupied += 1;
+                }
+            }
+        }
+        unsafe { ptr::swap_nonoverlapping(buf[occupied].as_mut_ptr(), bucket, 1) };
+        occupied += 1;
+        *self = Self { occupied, buf }
+    }
 
     /// Appends an element to the back of a collection.
     ///
@@ -587,7 +707,28 @@ impl<T, const N: usize> CopyVec<T, N> {
     //     R: RangeBounds<usize>,
 
     // pub fn into_flattened(self) -> Vec<T, A> (for CopyVec<[T; M], N>)
-    // pub fn dedup(&mut self) where T: PartialEq
+
+    /// Removes consecutive repeated elements in the vector according to the
+    /// [`PartialEq`] trait implementation.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 2, 3, 2];
+    ///
+    /// vec.dedup();
+    ///
+    /// assert_eq!(vec, [1, 2, 3, 2]);
+    /// ```
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.dedup_by(|l, r| l == r)
+    }
     // pub fn splice<R, I>(&mut self, range: R, replace_with: I) -> Splice<'_, <I as IntoIterator>::IntoIter, A>
 
     // pub fn extract_if<F>(&mut self, filter: F) -> ExtractIf<'_, T, F, A> ⓘ
@@ -1106,6 +1247,9 @@ mod tests {
         Insert(usize, T),
         SwapRemove(usize),
         Remove(usize),
+        Dedup,
+        RetainLt(T),
+        RetainGt(T),
     }
 
     impl<T> Arbitrary for Op<T>
@@ -1121,6 +1265,9 @@ mod tests {
                 Op::Insert(usize::arbitrary(g), T::arbitrary(g)),
                 Op::SwapRemove(usize::arbitrary(g)),
                 Op::Remove(usize::arbitrary(g)),
+                Op::Dedup,
+                Op::RetainLt(T::arbitrary(g)),
+                Op::RetainGt(T::arbitrary(g)),
             ];
             g.choose(&options).unwrap().clone()
         }
@@ -1137,7 +1284,7 @@ mod tests {
         assert_eq!(ours.as_slice(), theirs.as_slice());
     }
 
-    fn do_test<const N: usize, T: PartialEq + Copy + Debug>(ops: Vec<Op<T>>) {
+    fn do_test<const N: usize, T: PartialEq + Copy + Debug + PartialOrd>(ops: Vec<Op<T>>) {
         let mut ours = CopyVec::<T, N>::new();
         let mut theirs = Vec::new();
         theirs.reserve_exact(N);
@@ -1176,6 +1323,18 @@ mod tests {
                     if ix < theirs.len() {
                         assert_eq!(ours.remove(ix), theirs.remove(ix))
                     }
+                }
+                Op::Dedup => {
+                    ours.dedup();
+                    theirs.dedup();
+                }
+                Op::RetainLt(r) => {
+                    ours.retain(|t| *t < r);
+                    theirs.retain(|t| *t < r);
+                }
+                Op::RetainGt(r) => {
+                    ours.retain(|t| *t > r);
+                    theirs.retain(|t| *t > r);
                 }
             }
             check_invariants(&mut ours, &mut theirs)
