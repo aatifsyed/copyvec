@@ -170,14 +170,26 @@ impl<T, const N: usize> CopyVec<T, N> {
     // pub fn shrink_to_fit(&mut self)
     // pub fn shrink_to(&mut self, min_capacity: usize)
 
-    /// Converts the vector into [`Box<[T]>`](Box).
+    /// Converts the vector into [`Box<[T]>`][Box].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let v = copyvec![1, 2, 3];
+    ///
+    /// let slice = v.into_boxed_slice();
+    /// assert_eq!(&*slice, &[1, 2, 3])
+    /// ```
     #[cfg(feature = "alloc")]
-    pub fn into_boxed_slice(self) -> Box<[T]>
-    where
-        T: Clone, // TODO(0xaatif): https://github.com/rust-lang/rust/issues/63291
-                  //                remove this bound
-    {
-        self.as_slice().into()
+    pub fn into_boxed_slice(mut self) -> Box<[T]> {
+        let mut v = alloc::vec::Vec::<T>::with_capacity(self.len());
+        unsafe {
+            ptr::copy_nonoverlapping(self.as_ptr(), v.as_mut_ptr(), self.len());
+            v.set_len(self.len());
+            self.set_len(0);
+        }
+        v.into_boxed_slice()
     }
 
     /// Shortens the vector, keeping the first `len` elements and dropping the rest.
@@ -601,9 +613,32 @@ impl<T, const N: usize> CopyVec<T, N> {
         }
     }
 
-    // pub fn pop_if<F>(&mut self, f: F) -> Option<T>
-    // where
-    //     F: FnOnce(&mut T) -> bool,
+    /// Removes and returns the last element in a vector if the predicate
+    /// returns `true`, or [`None`] if the predicate returns false or the vector
+    /// is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3, 4];
+    /// let pred = |x: &mut i32| *x % 2 == 0;
+    ///
+    /// assert_eq!(vec.pop_if(pred), Some(4));
+    /// assert_eq!(vec, [1, 2, 3]);
+    /// assert_eq!(vec.pop_if(pred), None);
+    /// ```
+    pub fn pop_if<F>(&mut self, f: F) -> Option<T>
+    where
+        F: FnOnce(&mut T) -> bool,
+    {
+        let last = self.last_mut()?;
+        if f(last) {
+            self.pop()
+        } else {
+            None
+        }
+    }
 
     // pub fn append(&mut self, other: &mut Vec<T, A>)
 
@@ -1230,7 +1265,7 @@ trait Ext: Sized {
 }
 impl<T> Ext for T {}
 
-#[cfg(all(test, feature = "std"))]
+#[cfg(all(test, feature = "std", feature = "quickcheck"))]
 mod tests {
     use fmt::Debug;
     use quickcheck::Arbitrary;
