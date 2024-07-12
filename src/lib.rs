@@ -11,6 +11,11 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::{borrow::Cow, boxed::Box};
 
+#[cfg(feature = "quickcheck1")]
+mod _quickcheck1;
+#[cfg(feature = "serde1")]
+mod _serde1;
+
 use core::{
     array,
     borrow::{Borrow, BorrowMut},
@@ -84,7 +89,7 @@ macro_rules! copyvec {
 #[doc(hidden)]
 pub mod __private {
     use super::*;
-    pub use ::core::stringify;
+    pub use core::stringify;
 
     pub const fn from_slice<T, const N: usize>(slice: &[T]) -> CopyVec<T, N>
     where
@@ -1088,6 +1093,7 @@ impl<T> Ext for T {}
 mod tests {
     use fmt::Debug;
     use quickcheck::Arbitrary;
+    use quickcheck1 as quickcheck;
 
     use super::*;
 

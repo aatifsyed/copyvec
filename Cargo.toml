@@ -16,11 +16,16 @@ categories = [
 ]
 
 [dependencies]
+quickcheck1 = { package = "quickcheck", version = "1.0.3", optional = true, default-features = false }
+serde1 = { version = "1.0.204", package = "serde", default-features = false, optional = true }
 
 [features]
 alloc = []
 default = ["std"]
 std = ["alloc"]
+quickcheck = ["quickcheck1"]
+quickcheck1 = ["dep:quickcheck1"]
+serde = ["serde1"]
+serde1 = ["dep:serde1"]
 
 [dev-dependencies]
-quickcheck = "1.0.3"
