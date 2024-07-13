@@ -25,7 +25,7 @@
 //! }
 //!
 //! assert_eq!(vec, ["A", "b", "c", "d"]);
-//! vec.retain(|it| *it == "b" || *it == "c")
+//! vec.retain(|it| *it == "b" || *it == "c");
 //! assert_eq!(vec.remove(0), "b");
 //! ```
 //!
@@ -806,6 +806,12 @@ impl<T, const N: usize> CopyVec<T, N> {
 /// Methods that don't mirror [`std::vec::Vec`](https://doc.rust-lang.org/std/vec/struct.Vec.html)'s API.
 impl<T, const N: usize> CopyVec<T, N> {
     /// Create a full [`CopyVec`] from an array.
+    ///
+    /// ```rust
+    /// # use copyvec::CopyVec;
+    /// let vec = CopyVec::from_array([1, 2, 3]);
+    /// assert_eq!(vec.capacity(), 3);
+    /// ```
     pub const fn from_array(array: [T; N]) -> Self
     where
         T: Copy,
@@ -818,7 +824,40 @@ impl<T, const N: usize> CopyVec<T, N> {
         }
         Self { occupied: N, buf }
     }
-    /// Like [`Self::push_within_capacity`], but returns a [`std::error::Error`].
+    /// If the vec is full, convert it into an array.
+    ///
+    /// ```rust
+    /// # use copyvec::copyvec;
+    /// let vec = copyvec![1, 2, 3];
+    /// let arr = vec.into_array().unwrap();
+    /// ```
+    pub fn into_array(self) -> Option<[T; N]> {
+        let Self { occupied, buf } = self;
+        match occupied == N {
+            true => {
+                let mut new_buf = MaybeUninit::<[T; N]>::uninit();
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        buf.as_ptr().cast::<T>(),
+                        new_buf.as_mut_ptr().cast::<T>(),
+                        N,
+                    );
+                    Some(new_buf.assume_init())
+                }
+            }
+            false => None,
+        }
+    }
+    /// Like [`Self::push_within_capacity`], but returns an implementor of
+    /// [`std::error::Error`].
+    ///
+    /// ```
+    /// # use copyvec::CopyVec;
+    /// fn fallible(vec: &mut CopyVec<char, 10>) -> Result<(), Box<dyn std::error::Error>> {
+    ///     vec.try_push('a')?;
+    ///     Ok(())
+    /// }
+    /// ```
     pub fn try_push(&mut self, value: T) -> Result<(), Error>
     where
         T: Copy,
@@ -829,6 +868,11 @@ impl<T, const N: usize> CopyVec<T, N> {
         })
     }
     /// Fallible verson of [`FromIterator`], since `N` is expected to be small.
+    /// ```
+    /// # use copyvec::CopyVec;
+    /// CopyVec::<_, 2>::try_from_iter([1, 2, 3]).unwrap_err();
+    /// CopyVec::<_, 2>::try_from_iter([1, 2]).unwrap();
+    /// ```
     pub fn try_from_iter<I: IntoIterator<Item = T>>(iter: I) -> Result<Self, Error>
     where
         T: Copy,
@@ -838,6 +882,13 @@ impl<T, const N: usize> CopyVec<T, N> {
         Ok(this)
     }
     /// Fallible version of [`Extend`], since `N` is expected to be small.
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3];
+    /// vec.try_extend([1]).unwrap_err();
+    /// vec.pop();
+    /// vec.try_extend([1]).unwrap();
+    /// ```
     pub fn try_extend<I: IntoIterator<Item = T>>(&mut self, iter: I) -> Result<(), Error>
     where
         T: Copy,
@@ -856,6 +907,15 @@ impl<T, const N: usize> CopyVec<T, N> {
                 excess: Some(excess),
             }),
         }
+    }
+    /// Returns the number of unoccupied slots in the vec.
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let vec = copyvec![1, 2, 3; + 3];
+    /// assert_eq!(vec.remaining_capacity(), 3);
+    /// ```
+    pub const fn remaining_capacity(&self) -> usize {
+        self.capacity() - self.len()
     }
 }
 
