@@ -43,7 +43,7 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 use alloc::{borrow::Cow, boxed::Box};
 
-#[cfg(feature = "quickcheck1")]
+#[cfg(all(feature = "quickcheck1", feature = "alloc"))]
 mod _quickcheck1;
 #[cfg(feature = "serde1")]
 mod _serde1;
