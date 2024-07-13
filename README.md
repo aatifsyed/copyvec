@@ -26,7 +26,7 @@ for it in &mut vec {
 }
 
 assert_eq!(vec, ["A", "b", "c", "d"]);
-vec.retain(|it| *it == "b" || *it == "c")
+vec.retain(|it| *it == "b" || *it == "c");
 assert_eq!(vec.remove(0), "b");
 ```
 
