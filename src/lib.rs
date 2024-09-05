@@ -721,7 +721,40 @@ impl<T, const N: usize> CopyVec<T, N> {
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    // pub fn split_off(&mut self, at: usize) -> Vec<T, A>
+    /// Splits the collection into two at the given index.
+    ///
+    /// Returns a newly vector containing the elements in the range `[at, len)`.
+    /// After the call, the original vector will be left containing
+    /// the elements `[0, at)` with its previous capacity unchanged.
+    ///
+    /// - If you want to take ownership of the entire contents and capacity of
+    ///   the vector, see [`mem::take`] or [`mem::replace`].
+    /// - If you don't need the returned vector at all, see [`Self::truncate`].
+    // - If you want to take ownership of an arbitrary subslice, or you don't
+    //   necessarily want to store the removed items in a vector, see [`Self::drain`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use copyvec::copyvec;
+    /// let mut vec = copyvec![1, 2, 3];
+    /// let vec2 = vec.split_off(1);
+    /// assert_eq!(vec, [1]);
+    /// assert_eq!(vec2, [2, 3]);
+    /// ```
+    pub fn split_off(&mut self, at: usize) -> Self
+    where
+        T: Copy,
+    {
+        let (_, new) = self.as_slice().split_at(at);
+        let new = __private::from_slice(new);
+        self.truncate(at);
+        new
+    }
 
     // pub fn resize_with<F>(&mut self, new_len: usize, f: F)
     // where
