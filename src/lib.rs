@@ -972,7 +972,7 @@ impl fmt::Display for Error {
         let Self { capacity, excess } = self;
         match excess {
             Some(excess) => f.write_fmt(format_args!(
-                "exceed fixed capacity of {} by {} elements",
+                "exceeded fixed capacity of {} by {} elements",
                 capacity, excess
             )),
             None => f.write_fmt(format_args!("exceeded fixed capacity of {}", capacity)),
